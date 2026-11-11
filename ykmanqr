@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ykmanqr — add an OATH account to a YubiKey from a QR code on screen (Wayland).
+#
+# Select the QR code with the mouse (grim + slurp), decode it with zbarimg,
+# and pass the otpauth:// URI to `ykman oath accounts uri`.
+#
+# Usage: ykmanqr [-t|--touch] [-f|--force] [-y|--yes] [-p|--print] [IMAGE]
+#   -t, --touch   require touch on the YubiKey to generate codes
+#   -f, --force   overwrite an existing account with the same name
+#   -y, --yes     do not ask for confirmation
+#   -p, --print   only print the URI (contains the secret!), do not add it
+#   IMAGE         decode this image file instead of selecting a screen region
+
+set -euo pipefail
+
+die() { echo "ykmanqr: $*" >&2; exit 1; }
+
+touch_opt=() force_opt=() yes=0 print=0 image=""
+while (($#)); do
+  case "$1" in
+    -t|--touch) touch_opt=(--touch) ;;
+    -f|--force) force_opt=(--force) ;;
+    -y|--yes)   yes=1 ;;
+    -p|--print) print=1 ;;
+    -h|--help)  sed -n '2,13s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -*)         die "unknown option: $1" ;;
+    *)          [[ -z $image ]] || die "only one image allowed"; image="$1" ;;
+  esac
+  shift
+done
+
+need() { command -v "$1" >/dev/null || die "missing '$1' (install: $2)"; }
+need zbarimg "sudo dnf install zbar"
+((print)) || need ykman "sudo dnf install yubikey-manager"
+
+if [[ -n $image ]]; then
+  [[ -r $image ]] || die "cannot read $image"
+  decoded=$(zbarimg -q --raw "$image") || die "no QR code found in $image"
+else
+  need grim "sudo dnf install grim"
+  need slurp "sudo dnf install slurp"
+  echo "Select the QR code with the mouse (Esc to cancel)..." >&2
+  region=$(slurp) || die "selection cancelled"
+  decoded=$(grim -g "$region" - | zbarimg -q --raw -) || die "no QR code found in the selection"
+fi
+
+uris=$(grep '^otpauth://' <<<"$decoded" || true)
+if [[ -z $uris ]]; then
+  if grep -q '^otpauth-migration://' <<<"$decoded"; then
+    die "this is a Google Authenticator export (otpauth-migration://), not a single account QR code"
+  fi
+  die "QR code does not contain an otpauth:// URI"
+fi
+count=$(wc -l <<<"$uris")
+((count == 1)) || die "found $count otpauth QR codes; select just one"
+uri=$uris
+
+if ((print)); then
+  printf '%s\n' "$uri"
+  exit 0
+fi
+
+# Show what will be added, without revealing the secret.
+python3 -I - "$uri" >&2 <<'EOF'
+import sys
+from urllib.parse import urlsplit, unquote, parse_qs
+u = urlsplit(sys.argv[1])
+q = {k: v[0] for k, v in parse_qs(u.query).items()}
+label = unquote(u.path.lstrip("/"))
+issuer = q.get("issuer")
+print(f"Type:    {u.netloc.upper()}")
+print(f"Account: {label}")
+if issuer:
+    print(f"Issuer:  {issuer}")
+extra = ", ".join(f"{k}={q[k]}" for k in ("algorithm", "digits", "period") if k in q)
+if extra:
+    print(f"Params:  {extra}")
+EOF
+
+if ((!yes)); then
+  read -r -p "Add to YubiKey? [y/N] " ans
+  [[ $ans == [yY]* ]] || die "aborted"
+fi
+
+ykman oath accounts uri "${touch_opt[@]}" "${force_opt[@]}" "$uri"
+echo "Added." >&2
